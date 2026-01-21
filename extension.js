@@ -1,5 +1,7 @@
 const vscode = require('vscode');
 const cp = require('child_process');
+const fs = require('fs').promises;
+const path = require('path');
 
 const STATE_KEY = 'vscodeBorder.branchColors';
 const DEFAULT_COLORS = [
@@ -69,6 +71,14 @@ function activate(context) {
     color: null
   };
 
+  // Auto-manage gitignore for .vscode/settings.json
+  const workspaceFolder = getWorkspaceFolder();
+  if (workspaceFolder) {
+    ensureGitignore(workspaceFolder).catch(err => {
+      console.error('Failed to manage gitignore:', err);
+    });
+  }
+
   const viewProvider = new BorderViewProvider(() => state);
   const treeView = vscode.window.createTreeView('vscode-border-view', {
     treeDataProvider: viewProvider,
@@ -127,7 +137,7 @@ async function refreshForCurrentBranch(context, state, viewProvider) {
 
   state.branch = branch;
   state.color = await getColorForBranch(context, branch, false);
-  await applyColor(state.color);
+  await applyColor(state.color, context);
   viewProvider.refresh();
 }
 
@@ -155,7 +165,7 @@ async function randomizeColor(context, state, viewProvider, forceNew) {
     forceNew,
     state.color
   );
-  await applyColor(state.color);
+  await applyColor(state.color, context);
   viewProvider.refresh();
 }
 
@@ -208,7 +218,7 @@ function getPrimaryColors() {
   return DEFAULT_COLORS;
 }
 
-async function applyColor(color) {
+async function applyColor(color, context) {
   const workbench = vscode.workspace.getConfiguration('workbench');
   const existing = workbench.get('colorCustomizations');
   const base = isPlainObject(existing) ? existing : {};
@@ -248,6 +258,8 @@ async function applyColor(color) {
     merged,
     vscode.ConfigurationTarget.Workspace
   );
+
+  await updateThickBorderCss(color, context);
 }
 
 function withAlpha(hex, alpha) {
@@ -296,6 +308,26 @@ function isPlainObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
 }
 
+async function updateThickBorderCss(color, context) {
+  const cssPath = context.asAbsolutePath('resources/custom.css');
+  const cssContent = `:root {
+  --vscode-border-thickness: 4px;
+  --vscode-border-color: ${color};
+}
+
+.monaco-workbench,
+#workbench {
+  box-shadow: inset 0 0 0 var(--vscode-border-thickness) var(--vscode-border-color) !important;
+  outline: none;
+}
+`;
+  try {
+    await fs.writeFile(cssPath, cssContent, 'utf8');
+  } catch (err) {
+    console.error('Failed to update custom.css:', err);
+  }
+}
+
 async function getBranch(workspaceFolder) {
   const branch = await execGit(['branch', '--show-current'], workspaceFolder);
   if (branch) {
@@ -326,9 +358,44 @@ function execGit(args, cwd) {
 }
 
 async function enableThickBorder(context) {
+  const extensionId = 'be5invis.vscode-custom-css';
+  const customCss = vscode.extensions.getExtension(extensionId);
+  if (!customCss) {
+    const action = 'Open Extensions';
+    const choice = await vscode.window.showWarningMessage(
+      'Thick border requires the "Custom CSS and JS Loader" extension. Install it first.',
+      action
+    );
+    if (choice === action) {
+      vscode.commands.executeCommand('workbench.extensions.search', extensionId);
+    }
+    return;
+  }
+
+  if (!customCss.isActive) {
+    try {
+      await customCss.activate();
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        'Failed to activate Custom CSS and JS Loader. Reload the window and try again.'
+      );
+      return;
+    }
+  }
+
+  const config = vscode.workspace.getConfiguration();
+  if (
+    !config.inspect('vscode_custom_css.imports') ||
+    !config.inspect('vscode_custom_css.policy')
+  ) {
+    vscode.window.showWarningMessage(
+      'Custom CSS settings are not registered. Reload the window, then try again.'
+    );
+    return;
+  }
+
   const cssPath = context.asAbsolutePath('resources/custom.css');
   const cssUri = vscode.Uri.file(cssPath).toString();
-  const config = vscode.workspace.getConfiguration();
   const existingImports = config.get('vscode_custom_css.imports');
   const imports = Array.isArray(existingImports) ? [...existingImports] : [];
 
@@ -347,23 +414,48 @@ async function enableThickBorder(context) {
     vscode.ConfigurationTarget.Global
   );
 
-  const extensionId = 'be5invis.vscode-custom-css';
-  const customCss = vscode.extensions.getExtension(extensionId);
-  if (!customCss) {
-    const action = 'Open Extensions';
-    const choice = await vscode.window.showWarningMessage(
-      'Thick border uses the "Custom CSS and JS Loader" extension. Install it, then run "Reload Custom CSS and JS".',
-      action
-    );
-    if (choice === action) {
-      vscode.commands.executeCommand('workbench.extensions.search', extensionId);
-    }
-    return;
-  }
-
   vscode.window.showInformationMessage(
     'Custom CSS path set. Run "Reload Custom CSS and JS" from the Command Palette.'
   );
+}
+
+async function ensureGitignore(workspaceFolder) {
+  const gitignorePath = path.join(workspaceFolder, '.gitignore');
+  const settingsEntry = '.vscode/settings.json';
+
+  // Read existing .gitignore or create empty
+  let content = '';
+  try {
+    content = await fs.readFile(gitignorePath, 'utf8');
+  } catch (err) {
+    // File doesn't exist, will create
+  }
+
+  // Check if already ignored
+  const lines = content.split('\n').map(l => l.trim());
+  if (lines.includes(settingsEntry)) {
+    return; // Already ignored
+  }
+
+  // Append to .gitignore
+  const newContent = content.endsWith('\n') || content === ''
+    ? content + settingsEntry + '\n'
+    : content + '\n' + settingsEntry + '\n';
+
+  await fs.writeFile(gitignorePath, newContent, 'utf8');
+
+  // Check if file is tracked and untrack it
+  const isTracked = await execGit(
+    ['ls-files', '.vscode/settings.json'],
+    workspaceFolder
+  );
+
+  if (isTracked) {
+    await execGit(
+      ['rm', '--cached', '.vscode/settings.json'],
+      workspaceFolder
+    );
+  }
 }
 
 function deactivate() {}
